@@ -1,5 +1,6 @@
 # Full-text Atom feed of https://patrickcollison.com/dispatches, published to GitHub Pages.
 # Subscribe to: https://<your-username>.github.io/<this-repo>/feed.xml
+# One-time backfill of older posts: https://<your-username>.github.io/<this-repo>/archive.xml
 
 name: Dispatches feed
 
@@ -40,8 +41,14 @@ jobs:
           """Build a full-text Atom feed of Patrick Collison's Dispatches page.
 
           Reads https://patrickcollison.com/dispatches, turns each post into a feed
-          entry with its full text and full-size images, and writes feed.xml and a
-          small index.html into the output folder (default: site/).
+          entry with its full text and full-size images, and writes feed.xml,
+          archive.xml and a small index.html into the output folder (default: site/).
+
+          archive.xml is a one-time backfill. Unread Cloud deletes articles that are
+          over 90 days old once a feed has 10 newer ones, so the older dispatches never
+          stay in feed.xml there. The archive feed carries those older posts with a
+          fixed recent timestamp (real date shown at the top of each post), so they
+          can be read and saved.
           """
 
           import html
@@ -49,6 +56,7 @@ jobs:
           import re
           import sys
           import urllib.request
+          from datetime import datetime, timedelta, timezone
           from pathlib import Path
           from urllib.parse import urljoin
           from xml.etree import ElementTree as ET
@@ -62,17 +70,21 @@ jobs:
           BAD_XML_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
           MIN_ENTRIES = 5  # if the page layout changes, fail instead of publishing an empty feed
 
+          # Backfill settings. Both are fixed so archive.xml never changes from run to run.
+          ARCHIVE_BEFORE = "2026-04-17"  # posts dated before this go in archive.xml
+          ARCHIVE_STAMP = datetime(2026, 11, 5, 12, 0, tzinfo=timezone.utc)  # newest archived post; each older one is 1 minute earlier
 
-          def feed_url():
-              """Public URL of feed.xml on GitHub Pages, worked out from the repo name."""
+
+          def site_url():
+              """Public base URL of the GitHub Pages site, worked out from the repo name."""
               repo = os.environ.get("REPO", "")
               if "/" not in repo:
                   return None
               owner, name = repo.split("/", 1)
-              host = "https://" + owner.lower() + ".github.io"
+              host = "https://" + owner.lower() + ".github.io/"
               if name.lower() == owner.lower() + ".github.io":
-                  return host + "/feed.xml"
-              return host + "/" + name + "/feed.xml"
+                  return host
+              return host + name + "/"
 
 
           def load_page():
@@ -128,7 +140,21 @@ jobs:
               return day + "T12:00:00Z"
 
 
-          def build_feed(entries, self_url):
+          def main_items(entries):
+              return [dict(e, id=e["url"], stamp=stamp(e["date"])) for e in entries]
+
+
+          def archive_items(entries):
+              old = [e for e in entries if e["date"] < ARCHIVE_BEFORE]
+              items = []
+              for i, e in enumerate(old):  # newest first, one minute apart, so readers keep the original order
+                  when = (ARCHIVE_STAMP - timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                  note = "<p><i>Originally published " + e["date"] + ".</i></p>\n"
+                  items.append(dict(e, id=e["url"] + "#archive", stamp=when, body=note + e["body"]))
+              return items
+
+
+          def build_feed(items, title, feed_id, self_url):
               ET.register_namespace("", ATOM_NS)
 
               def add(parent, tag, text=None, **attrs):
@@ -138,23 +164,23 @@ jobs:
                   return el
 
               feed = ET.Element("{" + ATOM_NS + "}feed")
-              add(feed, "title", "Patrick Collison · Dispatches")
+              add(feed, "title", title)
               add(feed, "subtitle", "Longer posts by Patrick Collison, originally published on X.")
-              add(feed, "id", SOURCE)
+              add(feed, "id", feed_id)
               add(feed, "link", rel="alternate", type="text/html", href=SOURCE)
               if self_url:
                   add(feed, "link", rel="self", type="application/atom+xml", href=self_url)
-              add(feed, "updated", stamp(entries[0]["date"]))
+              add(feed, "updated", max(i["stamp"] for i in items))
               author = add(feed, "author")
               add(author, "name", "Patrick Collison")
               add(author, "uri", "https://patrickcollison.com")
-              for e in entries:
+              for e in items:
                   entry = add(feed, "entry")
                   add(entry, "title", e["title"])
-                  add(entry, "id", e["url"])
+                  add(entry, "id", e["id"])
                   add(entry, "link", rel="alternate", type="text/html", href=e["url"])
-                  add(entry, "published", stamp(e["date"]))
-                  add(entry, "updated", stamp(e["date"]))
+                  add(entry, "published", e["stamp"])
+                  add(entry, "updated", e["stamp"])
                   add(entry, "content", e["body"], type="html")
               ET.indent(feed)
               return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(feed, encoding="unicode") + "\n"
@@ -166,7 +192,8 @@ jobs:
           <title>Dispatches feed</title>
           <link rel="alternate" type="application/atom+xml" title="Patrick Collison · Dispatches" href="feed.xml">
           <p>Full-text feed of <a href="https://patrickcollison.com/dispatches">Patrick Collison's Dispatches</a>.
-          Subscribe with <a href="feed.xml">feed.xml</a>.</p>
+          Subscribe with <a href="feed.xml">feed.xml</a>.
+          Older posts, for a one-time backfill: <a href="archive.xml">archive.xml</a>.</p>
           """
 
 
@@ -175,10 +202,19 @@ jobs:
               entries = parse(load_page())
               if len(entries) < MIN_ENTRIES:
                   sys.exit("Found only %d dispatches; the page layout may have changed. Not publishing." % len(entries))
+              base = site_url()
               out.mkdir(parents=True, exist_ok=True)
-              (out / "feed.xml").write_text(build_feed(entries, feed_url()), encoding="utf-8")
+              feed = build_feed(main_items(entries), "Patrick Collison · Dispatches", SOURCE,
+                                base and base + "feed.xml")
+              (out / "feed.xml").write_text(feed, encoding="utf-8")
+              archived = archive_items(entries)
+              if archived:
+                  archive = build_feed(archived, "Patrick Collison · Dispatches (archive)", SOURCE + "#archive",
+                                       base and base + "archive.xml")
+                  (out / "archive.xml").write_text(archive, encoding="utf-8")
               (out / "index.html").write_text(INDEX, encoding="utf-8")
-              print("Wrote %d entries. Newest: %s %s" % (len(entries), entries[0]["date"], entries[0]["title"]))
+              print("Wrote %d entries to feed.xml and %d to archive.xml. Newest: %s %s"
+                    % (len(entries), len(archived), entries[0]["date"], entries[0]["title"]))
 
 
           if __name__ == "__main__":
