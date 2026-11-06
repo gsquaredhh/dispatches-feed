@@ -1,0 +1,204 @@
+# Full-text Atom feed of https://patrickcollison.com/dispatches, published to GitHub Pages.
+# Subscribe to: https://<your-username>.github.io/<this-repo>/feed.xml
+
+name: Dispatches feed
+
+on:
+  schedule:
+    - cron: "17 */3 * * *" # every 3 hours
+  workflow_dispatch: # adds a "Run workflow" button
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install BeautifulSoup
+        run: pip install beautifulsoup4
+
+      - name: Build feed
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          python - site <<'PY'
+          """Build a full-text Atom feed of Patrick Collison's Dispatches page.
+
+          Reads https://patrickcollison.com/dispatches, turns each post into a feed
+          entry with its full text and full-size images, and writes feed.xml and a
+          small index.html into the output folder (default: site/).
+          """
+
+          import html
+          import os
+          import re
+          import sys
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from xml.etree import ElementTree as ET
+
+          from bs4 import BeautifulSoup
+
+          SOURCE = "https://patrickcollison.com/dispatches"
+          ATOM_NS = "http://www.w3.org/2005/Atom"
+          DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+          IMAGE_RE = re.compile(r"\.(jpe?g|png|gif|webp)$", re.I)
+          BAD_XML_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+          MIN_ENTRIES = 5  # if the page layout changes, fail instead of publishing an empty feed
+
+
+          def feed_url():
+              """Public URL of feed.xml on GitHub Pages, worked out from the repo name."""
+              repo = os.environ.get("REPO", "")
+              if "/" not in repo:
+                  return None
+              owner, name = repo.split("/", 1)
+              host = "https://" + owner.lower() + ".github.io"
+              if name.lower() == owner.lower() + ".github.io":
+                  return host + "/feed.xml"
+              return host + "/" + name + "/feed.xml"
+
+
+          def load_page():
+              if os.environ.get("SOURCE_FILE"):  # local testing
+                  return Path(os.environ["SOURCE_FILE"]).read_text(encoding="utf-8")
+              agent = "dispatches-feed/1.0 (personal feed reader; github.com/" + os.environ.get("REPO", "") + ")"
+              request = urllib.request.Request(SOURCE, headers={"User-Agent": agent})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.read().decode("utf-8")
+
+
+          def clean_body(post):
+              """Make links absolute and swap thumbnails for full-size images."""
+              for el in post.find_all(href=True):
+                  el["href"] = urljoin(SOURCE, el["href"])
+              for el in post.find_all(src=True):
+                  el["src"] = urljoin(SOURCE, el["src"])
+              for img in post.find_all("img"):
+                  parent = img.parent
+                  if parent is not None and parent.name == "a" and IMAGE_RE.search(parent.get("href", "")):
+                      img["src"] = parent["href"]
+                      img.attrs.pop("height", None)
+                      img.attrs.pop("width", None)
+              return BAD_XML_CHARS.sub("", post.decode_contents().strip())
+
+
+          def parse(page):
+              soup = BeautifulSoup(page, "html.parser")
+              entries = []
+              for post in soup.select("div.post"):
+                  heading = post.find("h2")
+                  link = heading.find("a", href=True) if heading else None
+                  byline = post.find(class_="byline")
+                  date = DATE_RE.search(byline.get_text()) if byline else None
+                  if not (link and date):
+                      continue
+                  x_link = byline.find("a", href=True)
+                  x_post = x_link["href"] if x_link else None
+                  title = link.get_text(" ", strip=True)
+                  url = urljoin(SOURCE, link["href"])
+                  heading.decompose()
+                  byline.decompose()
+                  body = clean_body(post)
+                  if x_post:
+                      body += '\n<p><a href="' + html.escape(x_post, quote=True) + '">Originally posted on X</a></p>'
+                  entries.append({"title": title, "url": url, "date": date.group(0), "body": body})
+              entries.sort(key=lambda e: e["date"], reverse=True)
+              return entries
+
+
+          def stamp(day):
+              # Noon UTC keeps the date the same in US and European time zones.
+              return day + "T12:00:00Z"
+
+
+          def build_feed(entries, self_url):
+              ET.register_namespace("", ATOM_NS)
+
+              def add(parent, tag, text=None, **attrs):
+                  el = ET.SubElement(parent, "{" + ATOM_NS + "}" + tag, attrs)
+                  if text is not None:
+                      el.text = text
+                  return el
+
+              feed = ET.Element("{" + ATOM_NS + "}feed")
+              add(feed, "title", "Patrick Collison · Dispatches")
+              add(feed, "subtitle", "Longer posts by Patrick Collison, originally published on X.")
+              add(feed, "id", SOURCE)
+              add(feed, "link", rel="alternate", type="text/html", href=SOURCE)
+              if self_url:
+                  add(feed, "link", rel="self", type="application/atom+xml", href=self_url)
+              add(feed, "updated", stamp(entries[0]["date"]))
+              author = add(feed, "author")
+              add(author, "name", "Patrick Collison")
+              add(author, "uri", "https://patrickcollison.com")
+              for e in entries:
+                  entry = add(feed, "entry")
+                  add(entry, "title", e["title"])
+                  add(entry, "id", e["url"])
+                  add(entry, "link", rel="alternate", type="text/html", href=e["url"])
+                  add(entry, "published", stamp(e["date"]))
+                  add(entry, "updated", stamp(e["date"]))
+                  add(entry, "content", e["body"], type="html")
+              ET.indent(feed)
+              return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(feed, encoding="unicode") + "\n"
+
+
+          INDEX = """<!doctype html>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Dispatches feed</title>
+          <link rel="alternate" type="application/atom+xml" title="Patrick Collison · Dispatches" href="feed.xml">
+          <p>Full-text feed of <a href="https://patrickcollison.com/dispatches">Patrick Collison's Dispatches</a>.
+          Subscribe with <a href="feed.xml">feed.xml</a>.</p>
+          """
+
+
+          def main():
+              out = Path(sys.argv[1] if len(sys.argv) > 1 else "site")
+              entries = parse(load_page())
+              if len(entries) < MIN_ENTRIES:
+                  sys.exit("Found only %d dispatches; the page layout may have changed. Not publishing." % len(entries))
+              out.mkdir(parents=True, exist_ok=True)
+              (out / "feed.xml").write_text(build_feed(entries, feed_url()), encoding="utf-8")
+              (out / "index.html").write_text(INDEX, encoding="utf-8")
+              print("Wrote %d entries. Newest: %s %s" % (len(entries), entries[0]["date"], entries[0]["title"]))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      # GitHub pauses scheduled workflows in repos with no activity for 60 days.
+      # Re-enabling the workflow on each run keeps the schedule going.
+      - name: Keep schedule active
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh api -X PUT "repos/$REPO/actions/workflows/feed.yml/enable"
