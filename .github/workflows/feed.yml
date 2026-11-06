@@ -45,10 +45,12 @@ jobs:
           archive.xml and a small index.html into the output folder (default: site/).
 
           archive.xml is a one-time backfill. Unread Cloud deletes articles that are
-          over 90 days old once a feed has 10 newer ones, so the older dispatches never
-          stay in feed.xml there. The archive feed carries those older posts with a
-          fixed recent timestamp (real date shown at the top of each post), so they
-          can be read and saved.
+          over 90 days old once a feed has 10 newer ones, and it takes in only 10
+          articles from a feed at a time, so the older dispatches never stay in
+          feed.xml there. The archive feed carries those older posts with a recent
+          timestamp (real date shown at the top of each post), 10 or fewer per batch.
+          Batch 1 (Ruskin's Gothic back to Reddit medicine) is already in Unread and
+          stays there; this version serves batch 2, the 7 posts older than that.
           """
 
           import html
@@ -70,9 +72,10 @@ jobs:
           BAD_XML_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
           MIN_ENTRIES = 5  # if the page layout changes, fail instead of publishing an empty feed
 
-          # Backfill settings. Both are fixed so archive.xml never changes from run to run.
-          ARCHIVE_BEFORE = "2026-04-17"  # posts dated before this go in archive.xml
-          ARCHIVE_STAMP = datetime(2026, 11, 5, 12, 0, tzinfo=timezone.utc)  # newest archived post; each older one is 1 minute earlier
+          # Backfill settings. All fixed so archive.xml never changes from run to run.
+          ARCHIVE_BEFORE = "2025-09-14"  # batch 2: posts dated before Reddit medicine
+          ARCHIVE_STAMP = datetime(2026, 11, 6, 0, 0, tzinfo=timezone.utc)  # newer than batch 1; each older post is 1 minute earlier
+          ARCHIVE_ID = "#archive2"  # new IDs, so Unread treats these as articles it hasn't seen
 
 
           def site_url():
@@ -150,7 +153,7 @@ jobs:
               for i, e in enumerate(old):  # newest first, one minute apart, so readers keep the original order
                   when = (ARCHIVE_STAMP - timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
                   note = "<p><i>Originally published " + e["date"] + ".</i></p>\n"
-                  items.append(dict(e, id=e["url"] + "#archive", stamp=when, body=note + e["body"]))
+                  items.append(dict(e, id=e["url"] + ARCHIVE_ID, stamp=when, body=note + e["body"]))
               return items
 
 
